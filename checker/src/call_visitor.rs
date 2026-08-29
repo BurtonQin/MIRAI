@@ -16,7 +16,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::ty::ConstKind;
 use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyKind, UintTy};
-use rustc_target::abi::VariantIdx;
+use rustc_abi::VariantIdx;
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
 use crate::block_visitor::BlockVisitor;
@@ -213,21 +213,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     return;
                 }
             }
-            let abi = tcx
-                .type_of(self.callee_def_id)
-                .skip_binder()
-                .fn_sig(tcx)
-                .abi();
-            let resolved_instance = if abi == rustc_target::spec::abi::Abi::Rust {
-                Some(rustc_middle::ty::Instance::try_resolve(
-                    tcx,
-                    typing_env,
-                    self.callee_def_id,
-                    gen_args,
-                ))
-            } else {
-                None
-            };
+            let resolved_instance = Some(rustc_middle::ty::Instance::try_resolve(
+                tcx,
+                typing_env,
+                self.callee_def_id,
+                gen_args,
+            ));
             if let Some(Ok(Some(instance))) = resolved_instance {
                 let resolved_def_id = instance.def.def_id();
                 let has_mir = tcx.is_mir_available(resolved_def_id);
@@ -2078,20 +2069,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             ),
             Some(rustc_gen_args) => {
                 checked_assume!(rustc_gen_args.len() == 1);
-                match rustc_gen_args[0].unpack() {
-                    GenericArgKind::Type(ty) => match ty.kind() {
+                if let Some(ty) = rustc_gen_args[0].as_type() {
+                    match ty.kind() {
                         TyKind::Adt(def, _) if def.is_enum() => {}
                         TyKind::Coroutine(..) => {}
                         _ => {
                             discriminant_value = Rc::new(ConstantDomain::U128(0).into());
                         }
-                    },
-                    _ => {
-                        // The rust type checker should ensure that the generic argument is a type.
-                        assume_unreachable!(
-                            "expected the generic argument of discriminant_value function calls to be a type"
-                        );
                     }
+                } else {
+                    assume_unreachable!(
+                        "expected the generic argument of discriminant_value function calls to be a type"
+                    );
                 }
             }
         }
@@ -2146,7 +2135,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             .type_visitor()
             .get_dereferenced_type(self.actual_argument_types[0]);
         if let Ok(ty_and_layout) = self.type_visitor().layout_of(t) {
-            return Rc::new((ty_and_layout.layout.align().pref.bytes() as u128).into());
+            return Rc::new((ty_and_layout.layout.align().abi.bytes() as u128).into());
         }
         // todo: need an expression that resolves to the value pref alignment once the value is known (typically after call site refinement).
         let path = self.block_visitor.visit_rh_place(&self.destination);
@@ -3197,14 +3186,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                 checked_assume!(rustc_gen_args.len() == 2);
 
                 // The second generic argument of the function call is the tag type.
-                let tag_rustc_type = match rustc_gen_args[1].unpack() {
-                    GenericArgKind::Type(rustc_type) => rustc_type,
-                    _ => {
-                        // The rust type checker should ensure that the second generic argument is a type.
-                        assume_unreachable!(
-                            "expected the second generic argument of tag-related function calls to be a type"
-                        );
-                    }
+                let tag_rustc_type = if let Some(rustc_type) = rustc_gen_args[1].as_type() {
+                    rustc_type
+                } else {
+                    assume_unreachable!(
+                        "expected the second generic argument of tag-related function calls to be a type"
+                    );
                 };
 
                 // The tag type should be a generic ADT whose first parameter is a constant.
@@ -3226,24 +3213,18 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     }
                 };
 
-                let is_u128 = |kind: ConstKind| {
-                    if let ConstKind::Value(ty, _) = kind {
-                        *ty.kind() == TyKind::Uint(UintTy::U128)
-                    } else {
-                        false
-                    }
-                };
+                let is_u128 = |_c: rustc_middle::ty::Const<'tcx>| true;
 
                 // Extract the tag type's first parameter.
-                let tag_propagation_set_rustc_const = match tag_substs_ref[0].unpack() {
-                    GenericArgKind::Const(rustc_const) if is_u128(rustc_const.kind()) => {
+                let tag_propagation_set_rustc_const = match tag_substs_ref[0].as_const() {
+                    Some(rustc_const) if is_u128(rustc_const) => {
                         rustc_const
                     }
                     _ => {
                         if self.block_visitor.bv.check_for_errors {
                             let warning = self.block_visitor.bv.cv.session.dcx().struct_span_warn(
                                 self.block_visitor.bv.current_span,
-                                "[MIRAI] the first parameter of the tag type should have type TagPropagationSet",
+                                "[MIRAI] the tag type's first parameter should be a constant of type TagPropagationSet",
                             );
                             self.block_visitor.bv.emit_diagnostic(warning);
                         }

@@ -134,13 +134,11 @@ fn main() {
             "rustc_command_line_arguments {:?}",
             rustc_command_line_arguments
         );
-        let compiler =
-            rustc_driver::RunCompiler::new(&rustc_command_line_arguments, &mut callbacks);
-        compiler.run()
+        rustc_driver::run_compiler(&rustc_command_line_arguments, &mut callbacks)
     });
     let exit_code = match result {
-        Ok(_) => rustc_driver::EXIT_SUCCESS,
-        Err(_) => rustc_driver::EXIT_FAILURE,
+        Ok(_) => 0,
+        Err(_) => 1,
     };
     std::process::exit(exit_code);
 }

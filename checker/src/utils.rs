@@ -90,67 +90,7 @@ pub fn contains_function<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
 /// Returns true if the function identified by def_id is a public function.
 #[logfn(TRACE)]
 pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
-    use rustc_hir::def_id::LocalDefId;
-
-    if tcx.hir().get_if_local(def_id).is_some() {
-        let def_id = def_id.expect_local();
-        match tcx
-            .resolutions(())
-            .visibilities_for_hashing
-            .iter()
-            .find(|(id, _)| *id == def_id)
-        {
-            Some((_, vis)) => vis.is_public(),
-            None => {
-                let hir_id = tcx.local_def_id_to_hir_id(def_id);
-                match tcx.hir_node(hir_id) {
-                    Node::Expr(rustc_hir::Expr {
-                        kind: rustc_hir::ExprKind::Closure { .. },
-                        ..
-                    })
-                    | Node::Item(rustc_hir::Item {
-                        kind: rustc_hir::ItemKind::Use(_, rustc_hir::UseKind::ListStem),
-                        ..
-                    })
-                    | Node::OpaqueTy(..) => {
-                        ty::Visibility::Restricted(tcx.parent_module(hir_id).to_def_id())
-                            .is_public()
-                    }
-                    Node::ImplItem(..) => {
-                        let parent_def_id: LocalDefId = tcx.hir().get_parent_item(hir_id).def_id;
-                        match tcx.hir_node_by_def_id(parent_def_id) {
-                            Node::Item(rustc_hir::Item {
-                                kind:
-                                    rustc_hir::ItemKind::Impl(rustc_hir::Impl {
-                                        of_trait: Some(tr),
-                                        ..
-                                    }),
-                                ..
-                            }) => tr
-                                .path
-                                .res
-                                .opt_def_id()
-                                .map_or_else(
-                                    || {
-                                        tcx.sess.dcx().span_delayed_bug(
-                                            tr.path.span,
-                                            "trait without a def-id",
-                                        );
-                                        ty::Visibility::Public
-                                    },
-                                    |def_id| tcx.visibility(def_id),
-                                )
-                                .is_public(),
-                            _ => false,
-                        }
-                    }
-                    _ => false,
-                }
-            }
-        }
-    } else {
-        false
-    }
+    tcx.visibility(def_id).is_public()
 }
 
 /// Returns true if the function identified by def_id is defined as part of a trait.
@@ -216,7 +156,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
         TyKind::Adt(def, subs) => {
             str.push_str(qualified_type_name(tcx, def.did()).as_str());
             for sub in *subs {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let Some(ty) = sub.as_type() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -226,7 +166,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("closure_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in subs.as_closure().args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let Some(ty) = sub.as_type() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -241,7 +181,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
                 );
                 str.push_str(qualified_type_name(tcx, principal.def_id).as_str());
                 for sub in principal.args {
-                    if let GenericArgKind::Type(ty) = sub.unpack() {
+                    if let Some(ty) = sub.as_type() {
                         str.push('_');
                         append_mangled_type(str, ty, tcx);
                     }
@@ -256,7 +196,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("fn_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in *subs {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let Some(ty) = sub.as_type() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -266,7 +206,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("coroutine_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in subs.as_coroutine().args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let Some(ty) = sub.as_type() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -282,7 +222,7 @@ fn append_mangled_type<'tcx>(str: &mut String, ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) 
             str.push_str("impl_");
             str.push_str(qualified_type_name(tcx, *def_id).as_str());
             for sub in *args {
-                if let GenericArgKind::Type(ty) = sub.unpack() {
+                if let Some(ty) = sub.as_type() {
                     str.push('_');
                     append_mangled_type(str, ty, tcx);
                 }
@@ -496,7 +436,7 @@ pub fn def_id_display_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
 /// Returns false if any of the generic arguments are themselves generic
 pub fn are_concrete(gen_args: GenericArgsRef<'_>) -> bool {
     for gen_arg in gen_args.iter() {
-        if let GenericArgKind::Type(ty) = gen_arg.unpack() {
+        if let Some(ty) = gen_arg.as_type() {
             if !is_concrete(ty.kind()) {
                 return false;
             }

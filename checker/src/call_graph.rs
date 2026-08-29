@@ -1427,12 +1427,8 @@ impl CallSiteOutput {
             Entry::Vacant(v) => {
                 let index = files.len();
                 v.insert(index);
-                let mut file_name = None;
-                if let rustc_span::FileName::Real(real_fname) = fname {
-                    if let Some(p) = real_fname.remapped_path_if_available().to_str() {
-                        file_name = p.split("/lib/rustlib/src").last().map(|s| s.to_string());
-                    }
-                }
+                let file_str = format!("{fname:?}");
+                let file_name = file_str.split("/lib/rustlib/src").last().map(|s| s.to_string());
                 files.push(file_name.unwrap_or_else(|| "unknown".into()));
                 index
             }
