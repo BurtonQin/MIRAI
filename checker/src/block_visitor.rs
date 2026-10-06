@@ -20,11 +20,11 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::TypingMode;
 use rustc_middle::ty::{
     Const, CoroutineArgsExt, FloatTy, IntTy, ParamConst, ScalarInt, Ty, TyKind, UintTy, ValTree,
-    VariantDef,
+    ValTreeKind,
 };
 use rustc_middle::ty::{GenericArg, GenericArgsRef};
 use rustc_span::source_map::Spanned;
-use rustc_abi::{FieldIdx, Primitive, TagEncoding, VariantIdx, Variants, Size};
+use rustc_abi::{FieldIdx, Primitive, TagEncoding, VariantIdx, Variants};
 use rustc_trait_selection::infer::TyCtxtInferExt;
 
 use crate::abstract_value::{self, AbstractValue, AbstractValueTrait, BOTTOM};
@@ -1779,7 +1779,9 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             mir::Operand::Move(place) => {
                 self.visit_used_move(path, place);
             }
-            mir::Operand::RuntimeChecks(..) => {}
+            mir::Operand::RuntimeChecks(..) => {
+                self.bv.update_value_at(path, Rc::new(abstract_value::FALSE));
+            }
             mir::Operand::Constant(constant) => {
                 let mir::ConstOperand { const_, .. } = constant.borrow();
                 let rh_type = const_.ty();
@@ -2146,7 +2148,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 let (source_path, target_path) = match operand {
                     mir::Operand::Copy(place) |
                     mir::Operand::Move(place) => (self.visit_lh_place(place), path),
-                    mir::Operand::RuntimeChecks(..) => (Path::get_as_path(Rc::new(BOTTOM)), path),
+                    mir::Operand::RuntimeChecks(..) => (Path::get_as_path(Rc::new(abstract_value::FALSE)), path),
                     mir::Operand::Constant(..) => {
                         let source_value = self.visit_operand(operand);
                         let source_path = Path::get_as_path(source_value.clone());
@@ -2184,9 +2186,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     self.type_visitor_mut()
                         .set_path_rustc_type(Path::get_as_path(result.clone()), ty);
                 }
-                if matches!(source_value.expression, Expression::Variable { .. })
-                    && self.type_visitor().is_slice_pointer(source_type.kind())
-                {
+                if self.type_visitor().is_slice_pointer(source_type.kind()) {
                     // If operand is a slice pointer, we can't just look it up with visit_operand
                     // since, if known, its value is a (thin_pointer, length) pair.
                     // Beats me why pointer to pointer casts are done with CastKind::Misc rather
@@ -2425,6 +2425,16 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
     /// Apply the given unary operator to the operand and assign to path.
     #[logfn_inputs(TRACE)]
     fn visit_unary_op(&mut self, path: Rc<Path>, un_op: mir::UnOp, operand: &mir::Operand<'tcx>) {
+        if let mir::UnOp::PtrMetadata = un_op {
+            let operand_path = self.get_operand_path(operand);
+            let p = Path::new_field(operand_path, 1).canonicalize(&self.bv.current_environment);
+            let t = self
+                .type_visitor()
+                .get_path_rustc_type(&path, self.bv.current_span);
+            let result = self.bv.lookup_path_and_refine_result(p, t);
+            self.bv.update_value_at(path, result);
+            return;
+        }
         let operand = self.visit_operand(operand);
         let result = match un_op {
             mir::UnOp::Neg => operand.negate(),
@@ -2438,13 +2448,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                     operand.logical_not()
                 }
             }
-            mir::UnOp::PtrMetadata => {
-                let p = Path::new_field(Path::get_as_path(operand), 1);
-                let t = self
-                    .type_visitor()
-                    .get_path_rustc_type(&path, self.bv.current_span);
-                self.bv.lookup_path_and_refine_result(p, t)
-            }
+            mir::UnOp::PtrMetadata => unreachable!(),
         };
         self.bv.update_value_at(path, result);
     }
@@ -2627,7 +2631,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
     fn get_operand_path(&mut self, operand: &mir::Operand<'tcx>) -> Rc<Path> {
         match operand {
             mir::Operand::Copy(place) | mir::Operand::Move(place) => self.visit_rh_place(place),
-            mir::Operand::RuntimeChecks(..) => Path::new_computed(Rc::new(BOTTOM)),
+            mir::Operand::RuntimeChecks(..) => Path::new_computed(Rc::new(abstract_value::FALSE)),
             mir::Operand::Constant(..) => Path::new_computed(self.visit_operand(operand)),
         }
     }
@@ -2639,7 +2643,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             mir::Operand::Copy(place) | mir::Operand::Move(place) => self
                 .type_visitor()
                 .get_rustc_place_type(place, self.bv.current_span),
-            mir::Operand::RuntimeChecks(..) => self.bv.tcx.types.unit,
+            mir::Operand::RuntimeChecks(..) => self.bv.tcx.types.bool,
             mir::Operand::Constant(constant) => {
                 let mir::ConstOperand { const_, .. } = constant.borrow();
                 const_.ty()
@@ -2654,7 +2658,7 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         match operand {
             mir::Operand::Copy(place) => self.visit_copy(place),
             mir::Operand::Move(place) => self.visit_move(place),
-            mir::Operand::RuntimeChecks(..) => Rc::new(BOTTOM),
+            mir::Operand::RuntimeChecks(..) => Rc::new(abstract_value::FALSE),
             mir::Operand::Constant(constant) => {
                 let mir::ConstOperand { const_, .. } = constant.borrow();
                 self.visit_literal(const_)
@@ -2738,6 +2742,17 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         self.bv.cv.generic_args_cache.insert(def_id, args);
                     }
                 }
+                if !matches!(self.bv.tcx.def_kind(def_id), rustc_hir::def::DefKind::Static { .. }) {
+                    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+                    let uneval = rustc_middle::mir::UnevaluatedConst {
+                        def: def_id,
+                        args,
+                        promoted: unevaluated.promoted,
+                    };
+                    if let Ok(const_val) = self.bv.tcx.const_eval_resolve(typing_env, uneval, self.bv.current_span) {
+                        return self.visit_const_value(const_val, lty);
+                    }
+                }
                 if self.bv.tcx.is_mir_available(def_id) {
                     self.bv.import_static(Path::new_static(self.bv.tcx, def_id))
                 } else if self.bv.cv.known_names_cache.get(self.bv.tcx, def_id)
@@ -2818,8 +2833,74 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
             // See the `ScalarInt` documentation for how `ScalarInt` guarantees that equal values
             // of these types have the same representation.
             rustc_middle::ty::ConstKind::Value(val) => {
-                let (heap_block, _heap_path) = self.get_heap_block_and_path(self.bv.tcx.types.usize);
-                heap_block
+                let lty = val.ty;
+                if let Some(bytes) = self.try_get_raw_bytes_from_value(val) {
+                    match lty.kind() {
+                        TyKind::Array(elem_type, length) => {
+                            let length = self.bv.get_array_length(length);
+                            let (array_value, array_path) =
+                                self.get_heap_array_and_path(lty, bytes.len());
+                            self.deserialize_constant_array(array_path, bytes, length, *elem_type);
+                            return array_value;
+                        }
+                        TyKind::Ref(_, t, _) if matches!(t.kind(), TyKind::Slice(..)) => {
+                            let elem_type = self.type_visitor().get_element_type(*t);
+                            let bytes_per_elem = self.type_visitor().get_type_size(elem_type);
+                            let length = bytes.len() as u64 / bytes_per_elem.max(1);
+                            let (_, array_path) =
+                                self.get_heap_array_and_path(*t, bytes.len());
+                            self.deserialize_constant_array(
+                                array_path.clone(),
+                                bytes,
+                                length as usize,
+                                elem_type,
+                            );
+                            return AbstractValue::make_reference(array_path);
+                        }
+                        TyKind::Ref(_, t, _) if matches!(t.kind(), TyKind::Array(..)) => {
+                            let length = match t.kind() {
+                                TyKind::Array(_, length) => self.bv.get_array_length(length),
+                                _ => unreachable!(),
+                            };
+                            let elem_type = self.type_visitor().get_element_type(*t);
+                            let (_, array_path) =
+                                self.get_heap_array_and_path(*t, bytes.len());
+                            self.deserialize_constant_array(
+                                array_path.clone(),
+                                bytes,
+                                length,
+                                elem_type,
+                            );
+                            return AbstractValue::make_reference(array_path);
+                        }
+                        TyKind::Ref(_, t, _) if matches!(t.kind(), TyKind::Str) => {
+                            let s = std::str::from_utf8(bytes).unwrap_or("");
+                            let string_const = &mut self.bv.cv.constant_value_cache.get_string_for(s);
+                            let string_val: Rc<AbstractValue> = Rc::new(string_const.clone().into());
+                            let len_val: Rc<AbstractValue> =
+                                Rc::new(ConstantDomain::U128(s.len() as u128).into());
+
+                            let str_path = Path::new_computed(string_val.clone());
+                            self.bv.update_value_at(str_path.clone(), string_val);
+
+                            let len_path = Path::new_length(str_path.clone());
+                            self.bv.update_value_at(len_path, len_val);
+                            return AbstractValue::make_reference(str_path);
+                        }
+                        _ => {}
+                    }
+                }
+                match *val.valtree {
+                    ValTreeKind::Leaf(scalar_int) => {
+                        let (data, size) = Self::get_scalar_int_data(&scalar_int);
+                        self.get_constant_value_from_scalar(lty, data, size)
+                    }
+                    ValTreeKind::Branch(ref _branches) => {
+                        let (heap_block, heap_path) = self.get_heap_block_and_path(lty);
+                        self.deserialize_val_tree(&val.valtree, heap_path, lty);
+                        heap_block
+                    }
+                }
             }
             _ => {
                 debug!("kind {:?}", kind);
@@ -2828,14 +2909,39 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         }
     }
 
+    fn try_get_raw_bytes_from_value(
+        &self,
+        val: &rustc_middle::ty::Value<'tcx>,
+    ) -> Option<&'tcx [u8]> {
+        if let Some(bytes) = val.try_to_raw_bytes(self.bv.tcx) {
+            return Some(bytes);
+        }
+        if let TyKind::Ref(_, t, _) = val.ty.kind() {
+            if let TyKind::Array(elem_ty, _) = t.kind() {
+                if *elem_ty == self.bv.tcx.types.u8 {
+                    if let ValTreeKind::Branch(branch) = &**val.valtree {
+                        let bytes: Option<Vec<u8>> = branch
+                            .iter()
+                            .map(|ct| ct.try_to_leaf().map(|s| s.to_u8()))
+                            .collect();
+                        if let Some(bytes) = bytes {
+                            return Some(self.bv.tcx.arena.alloc_from_iter(bytes));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn get_heap_block_and_path(
         &mut self,
         lty: Ty<'tcx>,
     ) -> (Rc<AbstractValue>, Rc<Path>) {
-        let size = 0;
+        let (size, align) = self.type_visitor().get_type_size_and_alignment(lty);
         let (heap_block, heap_path) = self.bv.get_new_heap_block(
-            Rc::new((size as u128).into()),
-            Rc::new(1u128.into()),
+            Rc::new(size.into()),
+            Rc::new(align.into()),
             false,
             lty,
         );
@@ -2844,10 +2950,49 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
 
     fn deserialize_val_tree(
         &mut self,
-        _val_tree: &ValTree<'tcx>,
-        _target_path: Rc<Path>,
-        _ty: Ty<'tcx>,
+        val_tree: &ValTree<'tcx>,
+        target_path: Rc<Path>,
+        ty: Ty<'tcx>,
     ) {
+        match **val_tree {
+            ValTreeKind::Leaf(scalar_int) => {
+                let (data, size) = Self::get_scalar_int_data(&scalar_int);
+                let val = self.get_constant_value_from_scalar(ty, data, size);
+                self.bv.update_value_at(target_path, val);
+            }
+            ValTreeKind::Branch(ref branches) => {
+                match ty.kind() {
+                    TyKind::Array(_elem_ty, _) | TyKind::Slice(_elem_ty) => {
+                        for (i, branch_const) in branches.iter().enumerate() {
+                            let elem_path = Path::new_index(
+                                target_path.clone(),
+                                self.get_u128_const_val(i as u128),
+                            );
+                            let branch_val = self.visit_const(branch_const);
+                            self.bv.update_value_at(elem_path, branch_val);
+                        }
+                        let len_path = Path::new_length(target_path);
+                        let len_val = self.get_u128_const_val(branches.len() as u128);
+                        self.bv.update_value_at(len_path, len_val);
+                    }
+                    TyKind::Adt(def, _args) if def.is_struct() || def.is_enum() => {
+                        for (i, branch_const) in branches.iter().enumerate() {
+                            let field_path = Path::new_field(target_path.clone(), i);
+                            let branch_val = self.visit_const(branch_const);
+                            self.bv.update_value_at(field_path, branch_val);
+                        }
+                    }
+                    TyKind::Tuple(_types) => {
+                        for (i, branch_const) in branches.iter().enumerate() {
+                            let field_path = Path::new_field(target_path.clone(), i);
+                            let branch_val = self.visit_const(branch_const);
+                            self.bv.update_value_at(field_path, branch_val);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn get_scalar_int_data(scalar_int: &ScalarInt) -> (u128, usize) {

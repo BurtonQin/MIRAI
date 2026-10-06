@@ -327,13 +327,21 @@ pub mod core {
                 }
 
                 pub fn is_size_align_valid(size: usize, align: usize) -> bool {
-                    let Some(align) = Alignment::new(align) else {
-                        return false;
-                    };
-                    if size > max_size_for_align(align) {
+                    if align == 0 || (align & (align - 1)) != 0 {
                         return false;
                     }
-                    true
+                    size <= isize::MAX as usize
+                }
+
+                pub fn from_size_align(
+                    size: usize,
+                    align: usize,
+                ) -> Result<std::alloc::Layout, core::alloc::LayoutError> {
+                    if is_size_align_valid(size, align) {
+                        unsafe { Ok(std::alloc::Layout::from_size_align_unchecked(size, align)) }
+                    } else {
+                        Err(result!())
+                    }
                 }
             }
         }
@@ -4450,6 +4458,28 @@ pub mod core {
         }
 
         pub mod index {
+            pub fn slice_index_fail(start: usize, end: usize, len: usize) {
+                if start > len {
+                    panic!(
+                        "range start index {} out of range for slice of length {}",
+                        start, len
+                    );
+                }
+                if end > len {
+                    panic!(
+                        "range end index {} out of range for slice of length {}",
+                        end, len
+                    );
+                }
+                if start > end {
+                    panic!("slice index starts at after slice end");
+                }
+                panic!(
+                    "range end index {} out of range for slice of length {}",
+                    end, len
+                );
+            }
+
             pub fn slice_end_index_len_fail(index: usize, len: usize) {
                 panic!(
                     "range end index {} out of range for slice of length {}",

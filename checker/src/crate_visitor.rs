@@ -84,6 +84,9 @@ impl<'compilation> CrateVisitor<'compilation, '_> {
         let building_standard_summaries = std::env::var("MIRAI_START_FRESH").is_ok();
         for local_def_id in self.tcx.hir_body_owners() {
             let def_id = local_def_id.to_def_id();
+            if !self.tcx.def_kind(def_id).is_fn_like() {
+                continue;
+            }
             let name = utils::summary_key_str(self.tcx, def_id);
             if let Some(selections) = &selected_functions {
                 if !self.included_in(selections.as_ref(), name.as_ref(), def_id) {

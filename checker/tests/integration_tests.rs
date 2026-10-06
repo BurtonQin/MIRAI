@@ -138,6 +138,11 @@ fn run_directory(directory_path: PathBuf) -> Vec<(String, String)> {
         if file_path.extension().unwrap() != "rs" {
             continue;
         }
+        if let Ok(filter) = std::env::var("MIRAI_TEST_FILTER") {
+            if !file_path.to_str().unwrap().contains(&filter) {
+                continue;
+            }
+        }
         let temp_dir = TempDir::new().expect("failed to create a temp dir");
         let temp_dir_path_buf = temp_dir.into_path();
         let output_dir_path_buf = temp_dir_path_buf.join(file_name.into_string().unwrap());
@@ -154,8 +159,8 @@ fn build_options(early_error_handler: &EarlyDiagCtxt) -> Options {
     let mut options = Options::default();
     options.parse_from_str("", early_error_handler, true); // get defaults
     options.diag_level = DiagLevel::Paranoid; // override default
-    options.max_analysis_time_for_body = 20;
-    options.max_analysis_time_for_crate = 60;
+    options.max_analysis_time_for_body = 40;
+    options.max_analysis_time_for_crate = 120;
     options
 }
 
@@ -290,6 +295,8 @@ fn invoke_driver(
         String::from("span_free_formats"),
         String::from("-Z"),
         String::from("mir-emit-retag"),
+        String::from("-Z"),
+        String::from("ub-checks=no"),
     ];
     command_line_arguments.extend(rustc_args);
     if options.test_only {

@@ -166,6 +166,9 @@ pub enum KnownNames {
     StdPanickingBeginPanicFmt,
     StdPtrSwapNonOverlapping,
     StdSliceCmpMemcmp,
+    StdFmtArgumentsFromStr,
+    StdFmtArgumentsFromStrNonconst,
+    StdFmtArgumentsNew,
 }
 
 /// An analysis lifetime cache that contains a map from def ids to known names.
@@ -264,6 +267,7 @@ fn known_name_for_std_lib(path_segments: &[DisambiguatedDefPathData]) -> Option<
         [current_segment, tail_segments @ ..] => match name_from_type_ns(current_segment)? {
             "alloc" => get_known_name_for_alloc_namespace(tail_segments),
             "clone" => get_known_name_for_clone_namespace(tail_segments),
+            "fmt" => known_name_for_fmt_namespace(tail_segments),
             "future" => known_name_for_terminal_from_ns!(
                 tail_segments,
                 DefPathData::ValueNs,
@@ -326,6 +330,23 @@ fn get_known_name_for_clone_namespace(
         }
         _ => None,
     }
+}
+
+fn known_name_for_fmt_namespace(path_segments: &[DisambiguatedDefPathData]) -> Option<KnownNames> {
+    if let Some(last_segment) = path_segments.last() {
+        let name = name_from_value_ns(last_segment)?;
+        match name {
+            "from_str" => return Some(KnownNames::StdFmtArgumentsFromStr),
+            "from_str_nonconst" => return Some(KnownNames::StdFmtArgumentsFromStrNonconst),
+            "new" => {
+                if path_segments.iter().any(|s| matches!(s.data, DefPathData::Impl)) {
+                    return Some(KnownNames::StdFmtArgumentsNew);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn known_name_for_intrinsics_namespace(
@@ -505,7 +526,11 @@ fn known_name_for_ptr_namespace(path_segments: &[DisambiguatedDefPathData]) -> O
     match path_segments {
         [current_segment] => {
             let name = name_from_value_ns(current_segment)?;
-            (name == "swap_nonoverlapping").then_some(KnownNames::StdPtrSwapNonOverlapping)
+            match name {
+                "swap_nonoverlapping" => Some(KnownNames::StdPtrSwapNonOverlapping),
+                "write_bytes" => Some(KnownNames::StdIntrinsicsWriteBytes),
+                _ => None,
+            }
         }
         [current_segment, middle_segment, last_segment] => {
             let current_name = name_from_type_ns(current_segment)?;

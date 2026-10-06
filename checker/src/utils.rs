@@ -9,15 +9,13 @@ use std::rc::Rc;
 use log::debug;
 use log_derive::{logfn, logfn_inputs};
 
-use mirai_annotations::assume_unreachable;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
-use rustc_hir::Node;
 use rustc_middle::ty;
 use rustc_middle::ty::print::{FmtPrinter, Printer};
 use rustc_middle::ty::{
-    FloatTy, GenericArgKind, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, UintTy,
+    FloatTy, GenericArgsRef, IntTy, Ty, TyCtxt, TyKind, UintTy,
 };
 
 /// Returns the location of the rust system binaries that are associated with this build of Mirai.
@@ -90,7 +88,12 @@ pub fn contains_function<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
 /// Returns true if the function identified by def_id is a public function.
 #[logfn(TRACE)]
 pub fn is_public(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
-    tcx.visibility(def_id).is_public()
+    let def_kind = tcx.def_kind(def_id);
+    if matches!(def_kind, DefKind::Fn | DefKind::AssocFn) {
+        tcx.visibility(def_id).is_public()
+    } else {
+        false
+    }
 }
 
 /// Returns true if the function identified by def_id is defined as part of a trait.
@@ -382,7 +385,7 @@ fn push_component_name(component_data: DefPathData, target: &mut String) {
             Ctor => "ctor",
             AnonConst => "constant",
             OpaqueTy => "opaque",
-            _ => assume_unreachable!(),
+            _ => "other",
         }),
     };
 }

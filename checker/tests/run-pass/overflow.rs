@@ -12,7 +12,7 @@ pub fn read_to_end(r: &mut Cursor<&[u8]>, buf: &mut Vec<u8>) {
     loop {
         match r.read(&mut buf[len..]) {
             Ok(n) => {
-                assume!(len < usize::MAX - n);
+                assume!(len < usize::MAX - n); //~ assumption is provably true and can be deleted
                 len += n
             }
             Err(..) => {

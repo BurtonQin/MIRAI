@@ -17,7 +17,7 @@ use rustc_index::Idx;
 use rustc_middle::mir;
 use rustc_middle::ty::{
     AdtDef, Const, ConstKind, CoroutineArgsExt, ExistentialPredicate, ExistentialProjection,
-    ExistentialTraitRef, FnSig, GenericArg, GenericArgKind, GenericArgs, GenericArgsRef, ParamTy,
+    ExistentialTraitRef, FnSig, GenericArg, GenericArgs, GenericArgsRef, ParamTy,
     Ty, TyCtxt, TyKind,
 };
 use rustc_abi::VariantIdx;

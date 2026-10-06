@@ -1175,17 +1175,19 @@ impl PathRefinement for Rc<Path> {
                         if **selector == PathSelector::Deref {
                             if let PathEnum::Offset { value } = &qualifier.value {
                                 if let Expression::Offset { left, right } = &value.expression {
-                                    if let Expression::CompileTimeConstant(ConstantDomain::I128(
-                                        from,
-                                    )) = &right.expression
-                                    {
+                                    let from_opt = match &right.expression {
+                                        Expression::CompileTimeConstant(ConstantDomain::I128(from)) => Some(*from),
+                                        Expression::CompileTimeConstant(ConstantDomain::U128(from)) => Some(*from as i128),
+                                        _ => None,
+                                    };
+                                    if let Some(from) = from_opt {
                                         let base_path = Path::new_deref(
                                             Path::get_as_path(left.clone()),
                                             ExpressionType::NonPrimitive,
                                         );
-                                        let to = *from + (*count as i128);
+                                        let to = from + (*count as i128);
                                         let selector = Rc::new(PathSelector::ConstantSlice {
-                                            from: *from as u64,
+                                            from: from as u64,
                                             to: to as u64,
                                             from_end: false,
                                         });

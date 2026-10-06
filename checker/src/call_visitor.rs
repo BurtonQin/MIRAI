@@ -14,8 +14,7 @@ use log_derive::*;
 use mirai_annotations::*;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
-use rustc_middle::ty::ConstKind;
-use rustc_middle::ty::{GenericArg, GenericArgKind, GenericArgsRef, Ty, TyKind, UintTy};
+use rustc_middle::ty::{GenericArg, GenericArgsRef, Ty, TyKind};
 use rustc_abi::VariantIdx;
 
 use crate::abstract_value::{AbstractValue, AbstractValueTrait};
@@ -464,6 +463,12 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// result is false, just carry on with the normal logic.
     #[logfn_inputs(TRACE)]
     pub fn handled_as_special_function_call(&mut self) -> bool {
+        if let Some(fr) = &self.callee_func_ref {
+            if fr.summary_cache_key.contains("__rust_no_alloc_shim") {
+                self.use_entry_condition_as_exit_condition();
+                return true;
+            }
+        }
         match self.callee_known_name {
             KnownNames::StdCloneClone => {
                 checked_assume!(self.actual_argument_types.len() == 1);
@@ -472,8 +477,10 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             KnownNames::StdOpsFunctionFnCall
             | KnownNames::StdOpsFunctionFnMutCallMut
             | KnownNames::StdOpsFunctionFnOnceCallOnce => {
-                self.inline_indirectly_called_function();
-                return true;
+                if self.actual_args.len() == 1 || self.actual_args.len() == 2 {
+                    self.inline_indirectly_called_function();
+                    return true;
+                }
             }
             KnownNames::MiraiAbstractValue => {
                 checked_assume!(self.actual_args.len() == 1);
@@ -561,6 +568,36 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             }
             KnownNames::RustDealloc => {
                 self.handle_rust_dealloc();
+                self.use_entry_condition_as_exit_condition();
+                return true;
+            }
+            KnownNames::StdFmtArgumentsFromStr | KnownNames::StdFmtArgumentsFromStrNonconst => {
+                checked_assume!(!self.actual_args.is_empty());
+                let target_path = self.block_visitor.visit_rh_place(&self.destination);
+                let s = self.coerce_to_string(&self.actual_args[0].0.clone());
+                let string_const = self.block_visitor.bv.cv.constant_value_cache.get_string_for(&s);
+                let string_val: Rc<AbstractValue> = Rc::new(string_const.clone().into());
+                self.block_visitor.bv.update_value_at(target_path.clone(), string_val.clone());
+                let field0_path = Path::new_field(target_path, 0);
+                self.block_visitor.bv.update_value_at(field0_path, string_val);
+                self.use_entry_condition_as_exit_condition();
+                return true;
+            }
+            KnownNames::StdFmtArgumentsNew => {
+                checked_assume!(!self.actual_args.is_empty());
+                let target_path = self.block_visitor.visit_rh_place(&self.destination);
+                let template_path = self.actual_args[0].0.clone();
+                let template_val = self.actual_args[0].1.clone();
+                let s = if let Some(bytes) = self.extract_template_bytes(&template_path, &template_val) {
+                    Self::decode_format_template(&bytes)
+                } else {
+                    String::new()
+                };
+                let string_const = self.block_visitor.bv.cv.constant_value_cache.get_string_for(&s);
+                let string_val: Rc<AbstractValue> = Rc::new(string_const.clone().into());
+                self.block_visitor.bv.update_value_at(target_path.clone(), string_val.clone());
+                let field0_path = Path::new_field(target_path, 0);
+                self.block_visitor.bv.update_value_at(field0_path, string_val);
                 self.use_entry_condition_as_exit_condition();
                 return true;
             }
@@ -861,7 +898,16 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                     }
                     _ => {
                         let arguments_struct_path = self.actual_args[0].0.clone();
-                        let pieces_path_fat = Path::new_field(arguments_struct_path.clone(), 0)
+                        if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) =
+                            &self.actual_args[0].1.expression
+                        {
+                            s.clone()
+                        } else if let Some(s) = self.extract_string_value(&arguments_struct_path) {
+                            s
+                        } else if let Some(s) = self.extract_string_value(&Path::new_field(arguments_struct_path.clone(), 0)) {
+                            s
+                        } else {
+                            let pieces_path_fat = Path::new_field(arguments_struct_path.clone(), 0)
                             .canonicalize(&self.block_visitor.bv.current_environment);
                         let pieces_path_thin = Path::new_field(pieces_path_fat.clone(), 0);
                         let pieces_path_len = Path::new_length(pieces_path_fat);
@@ -906,7 +952,8 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
                         }
                         Rc::from(msg)
                     }
-                };
+                }
+            };
                 if msg.contains("entered unreachable code")
                     || msg.contains("not yet implemented")
                     || msg.contains("not implemented")
@@ -1230,7 +1277,7 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
     /// All of this happens in code that is not encoded as MIR, so MIRAI needs built in support for it.
     #[logfn_inputs(TRACE)]
     fn inline_indirectly_called_function(&mut self) {
-        checked_assume!(self.actual_args.len() == 2);
+        checked_assume!(self.actual_args.len() == 1 || self.actual_args.len() == 2);
         trace!("self.actual_args {:?}", self.actual_args);
         trace!(
             "self.actual_argument_types {:?}",
@@ -1244,35 +1291,38 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let callee = self.actual_args[0].1.clone();
         let callee_func_ref = self.block_visitor.get_func_ref(&callee);
 
-        // Get the path of the tuple containing the arguments.
-        let callee_arg_array_path = self.actual_args[1].0.clone();
         if let Some(func_ref) = &callee_func_ref {
             let def_id = func_ref.def_id.expect("defined when used here");
             let func_const = ConstantDomain::Function(func_ref.clone());
 
-            // Unpack the type of the second argument, which should be a tuple.
-            checked_assume!(self.actual_argument_types.len() == 2);
-            let mut actual_argument_types: Vec<Ty<'tcx>> =
-                if let TyKind::Tuple(tuple_types) = self.actual_argument_types[1].kind() {
-                    tuple_types.iter().collect()
-                } else {
-                    assume_unreachable!("expected second type argument to be a tuple type");
-                };
+            // Unpack the second argument, which should be a tuple (if present)
+            let (mut actual_argument_types, mut actual_args) = if self.actual_args.len() == 2 {
+                let callee_arg_array_path = self.actual_args[1].0.clone();
+                checked_assume!(self.actual_argument_types.len() == 2);
+                let arg_types: Vec<Ty<'tcx>> =
+                    if let TyKind::Tuple(tuple_types) = self.actual_argument_types[1].kind() {
+                        tuple_types.iter().collect()
+                    } else {
+                        assume_unreachable!("expected second type argument to be a tuple type");
+                    };
 
-            // Unpack the second argument, which should be a tuple
-            let mut actual_args: Vec<(Rc<Path>, Rc<AbstractValue>)> = actual_argument_types
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let arg_path = Path::new_field(callee_arg_array_path.clone(), i)
-                        .canonicalize(&self.block_visitor.bv.current_environment);
-                    let arg_val = self
-                        .block_visitor
-                        .bv
-                        .lookup_path_and_refine_result(arg_path.clone(), *t);
-                    (arg_path, arg_val)
-                })
-                .collect();
+                let args: Vec<(Rc<Path>, Rc<AbstractValue>)> = arg_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let arg_path = Path::new_field(callee_arg_array_path.clone(), i)
+                            .canonicalize(&self.block_visitor.bv.current_environment);
+                        let arg_val = self
+                            .block_visitor
+                            .bv
+                            .lookup_path_and_refine_result(arg_path.clone(), *t);
+                        (arg_path, arg_val)
+                    })
+                    .collect();
+                (arg_types, args)
+            } else {
+                (Vec::new(), Vec::new())
+            };
 
             // Prepend the callee closure/generator/function to the unpacked arguments vector
             // if the called function actually expects it.
@@ -2408,6 +2458,41 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
         let left_val = self.actual_args[0].1.clone();
         let right_val = self.actual_args[1].1.clone();
         let len_val = self.actual_args[2].1.clone();
+        if let Expression::CompileTimeConstant(ConstantDomain::U128(len)) = &len_val.expression {
+            let n = *len as usize;
+            let env = &self.block_visitor.bv.current_environment;
+            let arr1 = left_val
+                .try_resolve_as_byte_array(env)
+                .or_else(|| {
+                    AbstractValue::make_from(
+                        Expression::Variable {
+                            path: self.actual_args[0].0.clone(),
+                            var_type: ExpressionType::ThinPointer,
+                        },
+                        1,
+                    )
+                    .try_resolve_as_byte_array(env)
+                });
+            let arr2 = right_val
+                .try_resolve_as_byte_array(env)
+                .or_else(|| {
+                    AbstractValue::make_from(
+                        Expression::Variable {
+                            path: self.actual_args[1].0.clone(),
+                            var_type: ExpressionType::ThinPointer,
+                        },
+                        1,
+                    )
+                    .try_resolve_as_byte_array(env)
+                });
+            if let (Some(arr1), Some(arr2)) = (&arr1, &arr2) {
+                let n1 = usize::min(n, arr1.len());
+                let n2 = usize::min(n, arr2.len());
+                return Rc::new(
+                    ConstantDomain::I128(arr1[..n1].cmp(&arr2[..n2]) as i32 as i128).into(),
+                );
+            }
+        }
         AbstractValue::make_memcmp(left_val, right_val, len_val)
     }
 
@@ -3162,6 +3247,98 @@ impl<'call, 'block, 'analysis, 'compilation, 'tcx>
             self.block_visitor.bv.emit_diagnostic(warning);
         }
         Rc::from("dummy argument")
+    }
+
+    fn extract_string_value(&self, path: &Rc<Path>) -> Option<Rc<str>> {
+        if let Some(val) = self.block_visitor.bv.current_environment.value_at(path) {
+            if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &val.expression {
+                return Some(s.clone());
+            }
+            if let Expression::Reference(ref_path) = &val.expression {
+                if let Some(val2) = self.block_visitor.bv.current_environment.value_at(ref_path) {
+                    if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &val2.expression {
+                        return Some(s.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_template_bytes(&mut self, path: &Rc<Path>, val: &Rc<AbstractValue>) -> Option<Vec<u8>> {
+        let array_path = if let Expression::Reference(ref_path) = &val.expression {
+            ref_path.clone()
+        } else if let Some(val2) = self.block_visitor.bv.current_environment.value_at(path) {
+            if let Expression::Reference(ref_path) = &val2.expression {
+                ref_path.clone()
+            } else {
+                path.clone()
+            }
+        } else {
+            path.clone()
+        };
+        let len_path = Path::new_length(array_path.clone());
+        let len_val = self
+            .block_visitor
+            .bv
+            .lookup_path_and_refine_result(len_path, self.block_visitor.bv.tcx.types.usize);
+        let len = if let Expression::CompileTimeConstant(ConstantDomain::U128(l)) = &len_val.expression {
+            *l as usize
+        } else {
+            return None;
+        };
+        let mut bytes = Vec::with_capacity(len);
+        for i in 0..len {
+            let elem_path = Path::new_index(array_path.clone(), Rc::new((i as u128).into()));
+            let elem_val = self
+                .block_visitor
+                .bv
+                .lookup_path_and_refine_result(elem_path, self.block_visitor.bv.tcx.types.u8);
+            if let Expression::CompileTimeConstant(ConstantDomain::U128(b)) = &elem_val.expression {
+                bytes.push(*b as u8);
+            } else {
+                return None;
+            }
+        }
+        Some(bytes)
+    }
+
+    fn decode_format_template(mut bytes: &[u8]) -> String {
+        let mut result = String::new();
+        while let Some((&first, rest)) = bytes.split_first() {
+            bytes = rest;
+            if first == 0 {
+                break;
+            } else if first == 0x80 {
+                if bytes.len() < 2 { break; }
+                let len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                bytes = &bytes[2..];
+                if bytes.len() < len { break; }
+                if let Ok(s) = std::str::from_utf8(&bytes[..len]) {
+                    result.push_str(s);
+                }
+                bytes = &bytes[len..];
+            } else if first < 0x80 {
+                let len = first as usize;
+                if bytes.len() < len { break; }
+                if let Ok(s) = std::str::from_utf8(&bytes[..len]) {
+                    result.push_str(s);
+                }
+                bytes = &bytes[len..];
+            } else if (first & 0xC0) == 0xC0 {
+                result.push_str("{}");
+                let mut skip = 0;
+                if (first & 0x01) != 0 { skip += 4; }
+                if (first & 0x02) != 0 { skip += 2; }
+                if (first & 0x04) != 0 { skip += 2; }
+                if (first & 0x08) != 0 { skip += 2; }
+                if bytes.len() < skip { break; }
+                bytes = &bytes[skip..];
+            } else {
+                break;
+            }
+        }
+        result
     }
 
     /// Extract the tag kind and the propagation set from the generic arg of the function call

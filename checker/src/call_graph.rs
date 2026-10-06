@@ -1427,7 +1427,7 @@ impl CallSiteOutput {
             Entry::Vacant(v) => {
                 let index = files.len();
                 v.insert(index);
-                let file_str = format!("{fname:?}");
+                let file_str = fname.prefer_remapped_unconditionally().to_string();
                 let file_name = file_str.split("/lib/rustlib/src").last().map(|s| s.to_string());
                 files.push(file_name.unwrap_or_else(|| "unknown".into()));
                 index

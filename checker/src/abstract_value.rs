@@ -734,6 +734,10 @@ impl AbstractValue {
         )
     }
 
+    pub fn set_is_non_null(&self, non_null: bool) {
+        *self.is_non_null.borrow_mut() = Some(non_null);
+    }
+
     /// Creates an abstract value which represents the result of comparing the left operand with
     /// the right operand, according to the rules of memcmp in unix.
     #[logfn_inputs(TRACE)]
@@ -2024,7 +2028,6 @@ impl AbstractValueTrait for Rc<AbstractValue> {
 
     /// Returns an element that is "self.cmp(other)".
     #[logfn_inputs(TRACE)]
-    #[must_use]
     fn compare(&self, other: Self) -> Self {
         let zero = Rc::new(ConstantDomain::I128(0).into());
         let one = Rc::new(ConstantDomain::I128(1).into());
@@ -2714,6 +2717,13 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 && operand.is_zero()
                 && self.is_non_null() =>
             {
+                return Rc::new(FALSE);
+            }
+            // [not null == 0] -> false
+            (_, Expression::CompileTimeConstant(c)) if c.is_zero() && self.is_non_null() => {
+                return Rc::new(FALSE);
+            }
+            (Expression::CompileTimeConstant(c), _) if c.is_zero() && other.is_non_null() => {
                 return Rc::new(FALSE);
             }
 
@@ -4025,6 +4035,13 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 Expression::CompileTimeConstant(ConstantDomain::U128(0)),
                 Expression::Reference { .. },
             ) => {
+                return Rc::new(TRUE);
+            }
+            // [not null != 0] -> true
+            (_, Expression::CompileTimeConstant(c)) if c.is_zero() && self.is_non_null() => {
+                return Rc::new(TRUE);
+            }
+            (Expression::CompileTimeConstant(c), _) if c.is_zero() && other.is_non_null() => {
                 return Rc::new(TRUE);
             }
             // [0 != (1 << x)] -> true (we can assume no overflows occur)
@@ -5734,6 +5751,10 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::Join { left, right, .. } => left.is_non_null() && right.is_non_null(),
             Expression::Offset { left, .. } => left.is_non_null(),
             Expression::Reference(..) => true,
+            Expression::HeapBlock { .. } => true,
+            Expression::Transmute { operand, .. } | Expression::Cast { operand, .. } => {
+                operand.is_non_null()
+            }
             Expression::WidenedJoin { operand, .. } => operand.is_non_null(),
             _ => false,
         }
@@ -6154,23 +6175,17 @@ impl AbstractValueTrait for Rc<AbstractValue> {
             Expression::InitialParameterValue { path, var_type } => {
                 let refined_path =
                     path.refine_parameters_and_paths(args, result, pre_env, pre_env, fresh);
-                if let PathEnum::Computed { value } | PathEnum::Offset { value } =
+                if let PathEnum::Computed { value }
+                | PathEnum::HeapBlock { value }
+                | PathEnum::Offset { value } =
                     &refined_path.value
                 {
-                    return value.clone();
+                    value.clone()
                 } else if let Some(val) = pre_env.value_at(&refined_path) {
-                    return val.clone();
-                }
-                // If the path does not have a known value in the pre environment, make an unknown
-                // value. If the path is still rooted in parameter make sure that it does not get
-                // affected by subsequent side effects on the parameter.
-                if refined_path.is_rooted_by_parameter() {
-                    // This will not get refined again
+                    val.clone()
+                } else if refined_path.is_rooted_by_parameter() {
                     AbstractValue::make_initial_parameter_value(*var_type, refined_path)
                 } else {
-                    // The value is rooted in a local variable leaked from the callee or
-                    // in a static. In the latter case we want lookup_and_refine_value to
-                    // to see this. In the former, refinement is a no-op.
                     AbstractValue::make_typed_unknown(*var_type, refined_path)
                 }
             }
@@ -6424,11 +6439,10 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                 operand,
                 tag,
                 checking_presence,
-            } => AbstractValue::make_tag_check(
-                operand.refine_parameters_and_paths(args, result, pre_env, post_env, fresh),
-                *tag,
-                *checking_presence,
-            ),
+            } => {
+                let refined_operand = operand.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
+                AbstractValue::make_tag_check(refined_operand, *tag, *checking_presence)
+            },
             Expression::UnknownTagField { path } => {
                 let refined_path =
                     path.refine_parameters_and_paths(args, result, pre_env, post_env, fresh);
@@ -6914,34 +6928,52 @@ impl AbstractValueTrait for Rc<AbstractValue> {
     #[logfn_inputs(TRACE)]
     #[logfn(TRACE)]
     fn try_resolve_as_byte_array(&self, environment: &Environment) -> Option<Vec<u8>> {
-        if let Expression::Reference(path) = &self.expression {
-            if matches!(&path.value, PathEnum::HeapBlock { .. }) {
-                let heap_layout_path = Path::new_layout(path.clone());
-                if let Some(layout) = environment.value_at(&heap_layout_path) {
-                    if let Expression::HeapBlockLayout { length, .. } = &layout.expression {
-                        if let Expression::CompileTimeConstant(ConstantDomain::U128(len)) =
-                            length.expression
-                        {
-                            let mut arr = Vec::with_capacity(len as usize);
-                            for i in 0..(len as usize) {
-                                let elem_index = Rc::new(ConstantDomain::U128(i as u128).into());
-                                let elem_path = Path::new_index(path.clone(), elem_index);
-                                let elem_val = environment.value_at(&elem_path);
-                                if let Some(val) = elem_val {
-                                    if let Expression::CompileTimeConstant(ConstantDomain::U128(
-                                        v,
-                                    )) = &val.expression
-                                    {
-                                        arr.push(*v as u8);
-                                        continue;
-                                    }
-                                }
-                                return None;
-                            }
-                            return Some(arr);
+        if let Some(s) = self.try_resolve_as_ref_to_str(environment) {
+            return Some(s.as_bytes().to_vec());
+        }
+        let array_path = match &self.expression {
+            Expression::Reference(path) => Some(path.clone()),
+            Expression::Variable { path, .. } => {
+                if let Some(val) = environment.value_at(path) {
+                    if let Expression::Reference(ref_path) = &val.expression {
+                        Some(ref_path.clone())
+                    } else {
+                        Some(path.clone())
+                    }
+                } else {
+                    Some(path.clone())
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(path) = array_path {
+            let len_opt = if let Some(layout) = environment.value_at(&Path::new_layout(path.clone())) {
+                if let Expression::HeapBlockLayout { length, .. } = &layout.expression {
+                    if let Expression::CompileTimeConstant(ConstantDomain::U128(len)) = length.expression {
+                        Some(len as usize)
+                    } else { None }
+                } else { None }
+            } else if let Some(length_val) = environment.value_at(&Path::new_length(path.clone())) {
+                if let Expression::CompileTimeConstant(ConstantDomain::U128(len)) = length_val.expression {
+                    Some(len as usize)
+                } else { None }
+            } else { None };
+
+            if let Some(len) = len_opt {
+                let mut arr = Vec::with_capacity(len);
+                for i in 0..len {
+                    let elem_index = Rc::new(ConstantDomain::U128(i as u128).into());
+                    let elem_path = Path::new_index(path.clone(), elem_index);
+                    if let Some(val) = environment.value_at(&elem_path) {
+                        if let Expression::CompileTimeConstant(ConstantDomain::U128(v)) = &val.expression {
+                            arr.push(*v as u8);
+                            continue;
                         }
                     }
+                    return None;
                 }
+                return Some(arr);
             }
         }
         None
@@ -6949,12 +6981,40 @@ impl AbstractValueTrait for Rc<AbstractValue> {
 
     #[logfn_inputs(TRACE)]
     #[logfn(TRACE)]
-    fn try_resolve_as_ref_to_str(&self, _environment: &Environment) -> Option<Rc<str>> {
-        if let Expression::Variable {
-            path,
-            var_type: ExpressionType::ThinPointer,
-        } = &self.expression
-        {
+    fn try_resolve_as_ref_to_str(&self, environment: &Environment) -> Option<Rc<str>> {
+        if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &self.expression {
+            return Some(s.clone());
+        }
+        if let Expression::Reference(path) = &self.expression {
+            if let Some(val) = environment.value_at(path) {
+                if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &val.expression {
+                    return Some(s.clone());
+                }
+            }
+            if let PathEnum::Computed { value } = &path.value {
+                if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &value.expression {
+                    return Some(s.clone());
+                }
+            }
+        }
+        if let Expression::Variable { path, .. } = &self.expression {
+            if let Some(val) = environment.value_at(path) {
+                if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &val.expression {
+                    return Some(s.clone());
+                }
+                if let Expression::Reference(target_path) = &val.expression {
+                    if let Some(target_val) = environment.value_at(target_path) {
+                        if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &target_val.expression {
+                            return Some(s.clone());
+                        }
+                    }
+                    if let PathEnum::Computed { value } = &target_path.value {
+                        if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &value.expression {
+                            return Some(s.clone());
+                        }
+                    }
+                }
+            }
             if let PathEnum::QualifiedPath {
                 qualifier,
                 selector,
@@ -6968,6 +7028,25 @@ impl AbstractValueTrait for Rc<AbstractValue> {
                         &value.expression
                     {
                         return Some(s.clone());
+                    }
+                }
+                if let PathSelector::Field(0) = selector.as_ref() {
+                    if let Some(q_val) = environment.value_at(qualifier) {
+                        if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &q_val.expression {
+                            return Some(s.clone());
+                        }
+                        if let Expression::Reference(target_path) = &q_val.expression {
+                            if let Some(target_val) = environment.value_at(target_path) {
+                                if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &target_val.expression {
+                                    return Some(s.clone());
+                                }
+                            }
+                            if let PathEnum::Computed { value } = &target_path.value {
+                                if let Expression::CompileTimeConstant(ConstantDomain::Str(s)) = &value.expression {
+                                    return Some(s.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
