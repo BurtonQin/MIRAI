@@ -1242,6 +1242,10 @@ pub mod core {
     pub mod f64 {
         pub mod implement {
             pub mod to_bits {
+                // The transmute is deliberate: this contract body is what
+                // MIRAI substitutes for `f64::to_bits` calls, so the contract
+                // cannot call `to_bits` itself.
+                #[allow(unnecessary_transmutes)]
                 pub fn ct_f64_to_u64(ct: f64) -> u64 {
                     unsafe { std::mem::transmute::<f64, u64>(ct) }
                 }

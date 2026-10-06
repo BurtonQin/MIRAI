@@ -225,22 +225,6 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
         }
     }
 
-    /// Deinitializes the place.
-    ///
-    /// This writes `uninit` bytes to the entire place.
-    #[logfn_inputs(TRACE)]
-    fn visit_deinit(&mut self, place: &mir::Place<'tcx>) {
-        // let target_path = self.visit_lh_place(place);
-        // let value_map = self.bv.current_environment.value_map.clone();
-        // for (path, _) in value_map
-        //     .iter()
-        //     .filter(|(p, _)| (**p) == target_path || p.is_rooted_by(&target_path))
-        // {
-        //     self.bv
-        //         .update_value_at(path.clone(), abstract_value::BOTTOM.into());
-        // }
-    }
-
     /// Start a live range for the storage of the local.
     #[logfn_inputs(TRACE)]
     fn visit_storage_live(&mut self, local: mir::Local) {}
@@ -1660,7 +1644,6 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                 ResumedAfterDrop(_) => "coroutine resumed after drop",
                 NullPointerDereference => "null pointer dereference",
                 InvalidEnumConstruction(_) => "invalid enum construction",
-                _ => "assertion failed",
             }
         }
     }
@@ -2975,11 +2958,45 @@ impl<'block, 'analysis, 'compilation, 'tcx> BlockVisitor<'block, 'analysis, 'com
                         let len_val = self.get_u128_const_val(branches.len() as u128);
                         self.bv.update_value_at(len_path, len_val);
                     }
-                    TyKind::Adt(def, _args) if def.is_struct() || def.is_enum() => {
+                    TyKind::Adt(def, _args) if def.is_struct() => {
                         for (i, branch_const) in branches.iter().enumerate() {
                             let field_path = Path::new_field(target_path.clone(), i);
                             let branch_val = self.visit_const(branch_const);
                             self.bv.update_value_at(field_path, branch_val);
+                        }
+                    }
+                    TyKind::Adt(def, args) if def.is_enum() => {
+                        // The first branch of an enum valtree is the
+                        // discriminant; it determines which variant the
+                        // remaining branches belong to (restored from the
+                        // pre-upgrade handling that
+                        // `get_enum_variant_index` supports).
+                        let mut branch_iter = branches.iter();
+                        let variant_index =
+                            match branch_iter.next().and_then(|ct| ct.try_to_leaf()) {
+                                Some(scalar_int) => self
+                                    .get_enum_variant_index(
+                                        &scalar_int,
+                                        ty,
+                                        &target_path,
+                                    ),
+                                None => unreachable!(
+                                    "serialized enum value without a discriminant value {:?}",
+                                    branches
+                                ),
+                            };
+                        let variant = &def.variants()[variant_index];
+                        for (i, _field) in variant.fields.iter().enumerate() {
+                            if let Some(branch_const) = branch_iter.next() {
+                                let field_path = Path::new_field(target_path.clone(), i);
+                                let branch_val = self.visit_const(branch_const);
+                                self.bv.update_value_at(field_path, branch_val);
+                            } else {
+                                debug!(
+                                    "variant has more fields than was serialized {:?}",
+                                    variant
+                                );
+                            }
                         }
                     }
                     TyKind::Tuple(_types) => {
